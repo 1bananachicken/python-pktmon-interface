@@ -1,12 +1,16 @@
 param(
     [string]$Configuration = "Release",
+    [string]$OutputDir = "",
     [string]$OutputName = "pktmon_backend.dll"
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$BuildDir = Join-Path $Root "build"
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $Root "build"
+}
+$BuildDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
 $Source = Join-Path $Root "native\src\pktmon_backend.cpp"
 $Output = Join-Path $BuildDir $OutputName
 
@@ -54,6 +58,7 @@ if (-not $Cl) {
     throw "MSVC cl.exe was not found. Install Visual Studio Build Tools or set CL_EXE."
 }
 
+$ClDir = Split-Path $Cl -Parent
 $VcTools = Split-Path (Split-Path (Split-Path (Split-Path $Cl -Parent) -Parent) -Parent) -Parent
 $MsvcInclude = Join-Path $VcTools "include"
 $MsvcLib = Join-Path $VcTools "lib\x64"
@@ -79,6 +84,7 @@ $LibPaths = @(
 
 $env:INCLUDE = ($IncludePaths -join ";")
 $env:LIB = ($LibPaths -join ";")
+$env:PATH = "$ClDir;$env:PATH"
 
 & $Cl /nologo /std:c++17 /EHsc /LD /O2 /Fe:$Output $Source /link /nologo
 if ($LASTEXITCODE -ne 0) {

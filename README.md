@@ -47,6 +47,28 @@ You can point Python at another DLL with:
 $env:PKTMON_BACKEND_DLL = "C:\path\to\pktmon_backend.dll"
 ```
 
+## Package build
+
+Build a pip-installable wheel with the native DLL bundled:
+
+```powershell
+python -m pip install build
+powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 -OutputDir .\src\pktmon_interface
+python -m build
+```
+
+The wheel is written to `dist/` and is tagged as a Windows x64 platform wheel,
+for example:
+
+```text
+pktmon_interface-0.1.0-py3-none-win_amd64.whl
+```
+
+GitHub Actions runs tests on Python 3.10 through 3.13, builds the native DLL,
+builds the wheel/sdist, and uploads the distributions as workflow artifacts.
+Pushing a tag like `v0.1.0` also attaches those distributions to the GitHub
+release and publishes them to PyPI with the `PYPI_API_TOKEN` repository secret.
+
 ## Python API
 
 Scapy-like callback use:
