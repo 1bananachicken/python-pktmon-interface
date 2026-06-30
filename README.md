@@ -12,7 +12,6 @@ It provides:
 - a small C++ shim DLL over `PktMonApi.dll` realtime streams;
 - a Python `ctypes` wrapper exposed as `pktmon_interface.PktmonBackend`;
 - a Scapy-shaped async sniffer exposed as `pktmon_interface.PktmonSniffer`;
-- an ETL fallback reader built around `pktmon etl2pcap`;
 - a single CLI, `pktmon-interface`.
 
 The live capture path is Windows-only and generally requires an elevated
@@ -25,7 +24,6 @@ native/include/              C ABI consumed by Python
 native/src/                  Windows C++ pktmon shim
 scripts/build.ps1            MSVC build helper
 src/pktmon_interface/        Python package
-tests/                       Offline parser tests
 ```
 
 ## Setup
@@ -102,34 +100,23 @@ with PktmonSniffer(filter="udp", store=False) as sniffer:
 ```powershell
 pktmon-interface probe
 pktmon-interface packets --timeout 30 --probe
-pktmon-interface etl-packets --timeout 10 --debug
-pktmon-interface dump-raw --timeout 20 --out raw_pktmon_output.txt
 ```
 
-The native backend defaults to the direct `PktMonApi.dll` realtime stream. For
-diagnostics, the old `pktmon.exe --log-mode real-time` stdout path can still be
-forced:
-
-```powershell
-$env:PKTMON_BACKEND = "exe"
-pktmon-interface packets --timeout 30
-Remove-Item Env:\PKTMON_BACKEND
-```
+The native backend defaults to the documented `PktMonApi.dll` realtime stream
+and applies capture constraints to its own live session. If `PktMonApi.dll` is
+missing or does not expose the required realtime stream exports, startup fails
+with an error instead of falling back to another capture path.
 
 ## Notes
 
-`pktmon filter` is global system state. The native and ETL capture paths reset
-filters on start and stop because current Windows builds do not expose a stable
-per-filter removal workflow.
-
-The direct `PktMonApi.dll` stream ABI is undocumented. If a future Windows build
-changes it, `pktmon-interface probe` is the first diagnostic to run.
+The native backend does not use `pktmon filter` global system state. It only
+uses session capture constraints through `PktMonApi.dll`.
 
 ## Validation
 
 Offline validation:
 
 ```powershell
-python -m py_compile (Get-ChildItem -Recurse -Filter *.py src,tests).FullName
-python -m unittest discover -s tests
+python -m py_compile (Get-ChildItem -Recurse -Filter *.py src).FullName
+powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```

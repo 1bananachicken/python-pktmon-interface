@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
-import threading
 import time
-from pathlib import Path
 
 from .backend import PktmonBackend
-from .etl import PktmonEtlCapture
 from .models import CapturedPacket
 
 
@@ -32,45 +28,6 @@ def _format_packet(index: int, packet: CapturedPacket, hex_bytes: int = 32) -> s
     if hex_bytes > 0:
         line += " hex=" + packet.payload[:hex_bytes].hex(" ")
     return line
-
-
-def _run_pktmon(args: list[str]) -> tuple[int, str]:
-    proc = subprocess.run(
-        ["pktmon", *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    return proc.returncode, proc.stdout
-
-
-def _configure_raw_filter(packet_filter: str) -> None:
-    _run_pktmon(["filter", "remove"])
-    lower = packet_filter.lower()
-    commands: list[list[str]] = []
-    if "tcp" in lower:
-        port = "30031"
-        marker = "tcp port"
-        index = lower.find(marker)
-        if index >= 0:
-            value = lower[index + len(marker) :].strip().split(maxsplit=1)[0]
-            if value.isdigit():
-                port = value
-        commands.append(["filter", "add", "PktmonInterfaceRawTcp", "-t", "TCP", "-p", port])
-    if "udp" in lower:
-        commands.append(["filter", "add", "PktmonInterfaceRawUdp", "-t", "UDP"])
-    if not commands:
-        commands.append(["filter", "add", "PktmonInterfaceRawAll"])
-
-    for command in commands:
-        code, output = _run_pktmon(command)
-        print("> pktmon %s" % " ".join(command), flush=True)
-        if output.strip():
-            print(output.rstrip(), flush=True)
-        if code != 0:
-            raise RuntimeError("pktmon filter command failed with code %s" % code)
 
 
 def command_probe(_args: argparse.Namespace) -> int:
@@ -112,99 +69,6 @@ def command_packets(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_etl_packets(args: argparse.Namespace) -> int:
-    capture = PktmonEtlCapture(args.filter, chunk_seconds=args.chunk)
-    deadline = time.monotonic() + args.timeout if args.timeout > 0 else None
-    count = 0
-    print("starting pktmon ETL packet capture; run as Administrator", flush=True)
-    try:
-        capture.start()
-    except Exception as exc:
-        print("failed to start capture: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
-        return 2
-    try:
-        while deadline is None or time.monotonic() < deadline:
-            chunk = capture.capture_chunk()
-            if args.debug:
-                print(
-                    "chunk: etl=%d pcap=%d blocks=%s linktypes=%s raw=%d parsed=%d sample_linktype=%d"
-                    % (
-                        chunk.etl_size,
-                        chunk.pcap_size,
-                        sorted(set(chunk.block_types)),
-                        list(chunk.linktypes),
-                        chunk.raw_packets,
-                        chunk.parsed_packets,
-                        chunk.sample_linktype,
-                    ),
-                    flush=True,
-                )
-                if chunk.sample_hex:
-                    print("sample_hex: %s" % chunk.sample_hex, flush=True)
-            for packet in chunk.packets:
-                count += 1
-                print(_format_packet(count, packet, args.hex), flush=True)
-    except KeyboardInterrupt:
-        print("stopping", flush=True)
-    finally:
-        capture.close()
-    return 0
-
-
-def command_dump_raw(args: argparse.Namespace) -> int:
-    output_path = Path(args.out)
-    _configure_raw_filter(args.filter)
-    command = [
-        "pktmon",
-        "start",
-        "--capture",
-        "--comp",
-        "nics",
-        "--pkt-size",
-        args.pkt_size,
-        "--flags",
-        "0x10",
-        "--log-mode",
-        "real-time",
-    ]
-    print("> %s" % " ".join(command), flush=True)
-    print("writing raw output to %s" % output_path, flush=True)
-
-    with output_path.open("w", encoding="utf-8", errors="replace") as file:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-
-        def reader() -> None:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                file.write(line)
-                file.flush()
-                print(line, end="", flush=True)
-
-        thread = threading.Thread(target=reader, daemon=True)
-        thread.start()
-        try:
-            time.sleep(max(args.timeout, 0.1))
-        finally:
-            print("\n> pktmon stop", flush=True)
-            _run_pktmon(["stop"])
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            thread.join(timeout=2)
-            _run_pktmon(["filter", "remove"])
-    print("saved raw output to %s" % output_path, flush=True)
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Python interface for Windows pktmon.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -217,21 +81,6 @@ def build_parser() -> argparse.ArgumentParser:
     packets.add_argument("--hex", type=int, default=32)
     packets.add_argument("--probe", action="store_true")
     packets.set_defaults(func=command_packets)
-
-    etl_packets = subparsers.add_parser("etl-packets", help="Print packets from ETL chunks.")
-    etl_packets.add_argument("--filter", default=DEFAULT_FILTER)
-    etl_packets.add_argument("--chunk", type=float, default=0.75)
-    etl_packets.add_argument("--timeout", type=float, default=10.0)
-    etl_packets.add_argument("--hex", type=int, default=24)
-    etl_packets.add_argument("--debug", action="store_true")
-    etl_packets.set_defaults(func=command_etl_packets)
-
-    dump_raw = subparsers.add_parser("dump-raw", help="Dump raw pktmon real-time stdout.")
-    dump_raw.add_argument("--filter", default=DEFAULT_FILTER)
-    dump_raw.add_argument("--timeout", type=float, default=20.0)
-    dump_raw.add_argument("--pkt-size", default="0")
-    dump_raw.add_argument("--out", default="raw_pktmon_output.txt")
-    dump_raw.set_defaults(func=command_dump_raw)
     return parser
 
 

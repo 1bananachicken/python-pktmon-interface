@@ -1,4 +1,5 @@
 #include "../include/pktmon_backend.h"
+#include "../include/pktmon_api.h"
 
 #include <windows.h>
 
@@ -14,35 +15,22 @@
 #include <new>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
 
 constexpr int32_t kVersion = 3;
-constexpr uint32_t kPacketMonitorApiVersion = 0x00010000;
 
-constexpr std::array<const char*, 20> kPktmonExports = {
+constexpr std::array<const char*, 9> kPktmonExports = {
     "PacketMonitorAddCaptureConstraint",
-    "PacketMonitorAddSingleDataSourceToSession",
     "PacketMonitorAttachOutputToSession",
     "PacketMonitorCloseRealtimeStream",
     "PacketMonitorCloseSessionHandle",
     "PacketMonitorCreateLiveSession",
     "PacketMonitorCreateRealtimeStream",
-    "PacketMonitorEnumDataSources",
     "PacketMonitorInitialize",
     "PacketMonitorSetSessionActive",
     "PacketMonitorUninitialize",
-    "PktmonAddFilter",
-    "PktmonGetComponentList",
-    "PktmonGetFilterList",
-    "PktmonGetStatus",
-    "PktmonRemoveAllFilters",
-    "PktmonResetCounters",
-    "PktmonStart",
-    "PktmonStop",
-    "PktmonUnload",
 };
 
 struct ParsedPacket {
@@ -60,28 +48,31 @@ struct CaptureState {
     std::condition_variable ready;
     std::deque<ParsedPacket> queue;
     std::vector<uint8_t> read_payload;
-    std::thread reader;
     std::atomic<bool> stopping = false;
     bool started = false;
-    HANDLE process = nullptr;
-    HANDLE thread = nullptr;
-    HANDLE stdout_read = nullptr;
-    HANDLE stdout_write = nullptr;
     HMODULE pktmon_api = nullptr;
-    void* api_handle = nullptr;
-    void* session_handle = nullptr;
-    void* stream_handle = nullptr;
+    PACKETMONITOR_HANDLE api_handle = nullptr;
+    PACKETMONITOR_SESSION session_handle = nullptr;
+    PACKETMONITOR_REALTIME_STREAM stream_handle = nullptr;
     std::string last_error;
 };
 
-using FnPacketMonitorInitialize = long(WINAPI*)(uint32_t, void*, void**);
-using FnPacketMonitorUninitialize = long(WINAPI*)(void*);
-using FnPacketMonitorCreateLiveSession = long(WINAPI*)(void*, const wchar_t*, void**);
-using FnPacketMonitorCloseSessionHandle = long(WINAPI*)(void*);
-using FnPacketMonitorCreateRealtimeStream = long(WINAPI*)(void*, const void*, void**);
-using FnPacketMonitorCloseRealtimeStream = long(WINAPI*)(void*);
-using FnPacketMonitorAttachOutputToSession = long(WINAPI*)(void*, void*);
-using FnPacketMonitorSetSessionActive = long(WINAPI*)(void*, BOOL);
+using FnPacketMonitorInitialize =
+    HRESULT(WINAPI*)(uint32_t, void*, PACKETMONITOR_HANDLE*);
+using FnPacketMonitorUninitialize = HRESULT(WINAPI*)(PACKETMONITOR_HANDLE);
+using FnPacketMonitorCreateLiveSession =
+    HRESULT(WINAPI*)(PACKETMONITOR_HANDLE, PCWSTR, PACKETMONITOR_SESSION*);
+using FnPacketMonitorCloseSessionHandle = HRESULT(WINAPI*)(PACKETMONITOR_SESSION);
+using FnPacketMonitorCreateRealtimeStream = HRESULT(WINAPI*)(
+    PACKETMONITOR_HANDLE,
+    const PACKETMONITOR_REALTIME_STREAM_CONFIGURATION*,
+    PACKETMONITOR_REALTIME_STREAM*);
+using FnPacketMonitorCloseRealtimeStream = HRESULT(WINAPI*)(PACKETMONITOR_REALTIME_STREAM);
+using FnPacketMonitorAttachOutputToSession =
+    HRESULT(WINAPI*)(PACKETMONITOR_SESSION, void*);
+using FnPacketMonitorSetSessionActive = HRESULT(WINAPI*)(PACKETMONITOR_SESSION, BOOLEAN);
+using FnPacketMonitorAddCaptureConstraint =
+    HRESULT(WINAPI*)(PACKETMONITOR_SESSION, const PACKETMONITOR_PROTOCOL_CONSTRAINT*);
 
 struct DirectApi {
     FnPacketMonitorInitialize initialize = nullptr;
@@ -92,28 +83,15 @@ struct DirectApi {
     FnPacketMonitorCloseRealtimeStream close_stream = nullptr;
     FnPacketMonitorAttachOutputToSession attach_output = nullptr;
     FnPacketMonitorSetSessionActive set_active = nullptr;
+    FnPacketMonitorAddCaptureConstraint add_capture_constraint = nullptr;
 };
 
-struct DirectStreamConfig {
-    void* context;
-    void* event_callback;
-    void* packet_callback;
-    uint16_t queue_count;
-    uint16_t packet_slots;
-    uint32_t reserved;
-};
-
-static_assert(sizeof(DirectStreamConfig) == 0x20, "PktMonApi stream config ABI changed");
-
-struct DirectPacketView {
-    const uint8_t* data;
-    uint32_t data_size;
-    uint32_t reserved0;
-    uint32_t packet_offset;
-    uint32_t packet_size;
-    uint32_t record_flags;
-    uint32_t sequence;
-};
+static_assert(
+    sizeof(PACKETMONITOR_REALTIME_STREAM_CONFIGURATION) == 0x20,
+    "PktMonApi stream configuration ABI changed");
+static_assert(
+    sizeof(PACKETMONITOR_STREAM_DATA_DESCRIPTOR) == 0x20,
+    "PktMonApi stream data descriptor ABI changed");
 
 struct ExportProbe {
     HMODULE module = nullptr;
@@ -153,6 +131,14 @@ double unix_time_now() {
     return static_cast<double>(now - kUnixEpochFileTime) / 10000000.0;
 }
 
+double unix_time_from_system_time(int64_t system_time) {
+    constexpr int64_t kUnixEpochFileTime = 116444736000000000LL;
+    if (system_time <= kUnixEpochFileTime) {
+        return unix_time_now();
+    }
+    return static_cast<double>(system_time - kUnixEpochFileTime) / 10000000.0;
+}
+
 ExportProbe probe_exports() {
     ExportProbe probe;
     probe.module = LoadLibraryW(L"PktMonApi.dll");
@@ -172,9 +158,10 @@ ExportProbe probe_exports() {
 std::string export_report() {
     ExportProbe probe = probe_exports();
     std::ostringstream out;
+    const bool capture_ready = probe.module != nullptr && probe.missing.empty();
     out << "{";
     out << "\"dll_loaded\":" << (probe.module != nullptr ? "true" : "false") << ",";
-    out << "\"capture_ready\":true,";
+    out << "\"capture_ready\":" << (capture_ready ? "true" : "false") << ",";
     out << "\"backend\":\"PktMonApi.dll direct realtime stream\",";
     out << "\"exports\":[";
     bool first = true;
@@ -189,7 +176,7 @@ std::string export_report() {
             << (present ? "true" : "false") << "}";
     }
     out << "],";
-    out << "\"note\":\"direct PktMonApi.dll realtime stream ABI is used first; ETL capture remains available as fallback diagnostics\"";
+    out << "\"note\":\"PktMonApi.dll realtime stream is the only capture backend\"";
     out << "}";
     if (probe.module != nullptr) {
         FreeLibrary(probe.module);
@@ -206,78 +193,6 @@ uint32_t copy_text(const std::string& text, char* buffer, uint32_t buffer_size) 
     memcpy(buffer, text.c_str(), count - 1);
     buffer[count - 1] = '\0';
     return needed;
-}
-
-std::wstring widen(const std::string& text) {
-    if (text.empty()) {
-        return std::wstring();
-    }
-    int count = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-    if (count <= 0) {
-        return std::wstring(text.begin(), text.end());
-    }
-    std::wstring output(static_cast<size_t>(count), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, output.data(), count);
-    if (!output.empty() && output.back() == L'\0') {
-        output.pop_back();
-    }
-    return output;
-}
-
-int run_pktmon_command(const std::wstring& arguments, std::string* output) {
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    HANDLE read_pipe = nullptr;
-    HANDLE write_pipe = nullptr;
-    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
-        return static_cast<int>(GetLastError());
-    }
-    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-
-    std::wstring command = L"pktmon.exe " + arguments;
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = write_pipe;
-    si.hStdError = write_pipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION pi{};
-
-    BOOL ok = CreateProcessW(
-        nullptr,
-        command.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        nullptr,
-        &si,
-        &pi);
-    CloseHandle(write_pipe);
-    if (!ok) {
-        CloseHandle(read_pipe);
-        return static_cast<int>(GetLastError());
-    }
-
-    std::string text;
-    char buffer[4096];
-    DWORD read = 0;
-    while (ReadFile(read_pipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
-        text.append(buffer, buffer + read);
-    }
-    WaitForSingleObject(pi.hProcess, 15000);
-    DWORD exit_code = 1;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(read_pipe);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    if (output != nullptr) {
-        *output = text;
-    }
-    return static_cast<int>(exit_code);
 }
 
 bool contains_case_insensitive(const std::string& text, const std::string& needle) {
@@ -322,110 +237,133 @@ int extract_port_after(const std::string& filter, const std::string& marker) {
     return value;
 }
 
-bool configure_filters(const std::string& filter, std::string* error) {
-    std::string ignored;
-    run_pktmon_command(L"filter remove", &ignored);
-
-    std::vector<std::wstring> commands;
-    if (contains_case_insensitive(filter, "tcp")) {
-        int port = extract_port_after(filter, "tcp port");
-        if (port <= 0) {
-            port = extract_port_after(filter, "port");
-        }
-        std::wstringstream command;
-        command << L"filter add PktmonInterfaceTcp -t TCP";
-        if (port > 0) {
-            command << L" -p " << port;
-        }
-        commands.push_back(command.str());
-    }
-    if (contains_case_insensitive(filter, "udp")) {
-        int port = extract_port_after(filter, "udp port");
-        std::wstringstream command;
-        command << L"filter add PktmonInterfaceUdp -t UDP";
-        if (port > 0) {
-            command << L" -p " << port;
-        }
-        commands.push_back(command.str());
-    }
-    if (commands.empty()) {
-        commands.push_back(L"filter add PktmonInterfaceAll");
-    }
-
-    for (const auto& command : commands) {
-        std::string output;
-        int code = run_pktmon_command(command, &output);
-        if (code != 0) {
-            if (error != nullptr) {
-                *error = "pktmon filter command failed: " + output;
-            }
-            return false;
+std::string ascii_lower(std::string text) {
+    for (char& c : text) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c + ('a' - 'A'));
         }
     }
-    return true;
+    return text;
 }
 
-int hex_value(char c) {
-    if (c >= '0' && c <= '9') {
-        return c - '0';
+void set_constraint_name(PACKETMONITOR_PROTOCOL_CONSTRAINT* constraint, const wchar_t* name) {
+    if (constraint == nullptr || name == nullptr) {
+        return;
     }
-    if (c >= 'a' && c <= 'f') {
-        return c - 'a' + 10;
-    }
-    if (c >= 'A' && c <= 'F') {
-        return c - 'A' + 10;
-    }
-    return -1;
+    wcsncpy_s(constraint->Name, PACKETMONITOR_MAX_NAME_LENGTH, name, _TRUNCATE);
 }
 
-bool is_hex_token(const std::string& token) {
-    if (token.empty() || token.size() > 8) {
+HRESULT add_protocol_constraint(
+    const DirectApi& api,
+    PACKETMONITOR_SESSION session,
+    const wchar_t* name,
+    uint8_t protocol,
+    uint16_t source_port,
+    uint16_t destination_port) {
+    PACKETMONITOR_PROTOCOL_CONSTRAINT constraint{};
+    set_constraint_name(&constraint, name);
+    constraint.IsPresent.TransportProtocol = 1;
+    constraint.TransportProtocol = protocol;
+    if (source_port > 0) {
+        constraint.IsPresent.Port1 = 1;
+        constraint.Port1 = source_port;
+    }
+    if (destination_port > 0) {
+        constraint.IsPresent.Port2 = 1;
+        constraint.Port2 = destination_port;
+    }
+    return api.add_capture_constraint(session, &constraint);
+}
+
+bool configure_session_constraints(
+    const DirectApi& api,
+    PACKETMONITOR_SESSION session,
+    const std::string& filter,
+    std::string* error) {
+    if (api.add_capture_constraint == nullptr || session == nullptr) {
+        if (error != nullptr) {
+            *error = "PacketMonitorAddCaptureConstraint is not available";
+        }
         return false;
     }
-    for (char c : token) {
-        if (hex_value(c) < 0) {
+
+    const std::string lower = ascii_lower(filter);
+    auto add_or_error = [&](const wchar_t* name,
+                            uint8_t protocol,
+                            uint16_t source_port,
+                            uint16_t destination_port) -> bool {
+        HRESULT hr = add_protocol_constraint(
+            api,
+            session,
+            name,
+            protocol,
+            source_port,
+            destination_port);
+        if (failed_hr(hr)) {
+            if (error != nullptr) {
+                *error = hresult_message("PacketMonitorAddCaptureConstraint", hr);
+            }
+            return false;
+        }
+        return true;
+    };
+
+    if (contains_case_insensitive(lower, "tcp")) {
+        int port = extract_port_after(lower, "tcp port");
+        if (port <= 0) {
+            port = extract_port_after(lower, "port");
+        }
+        if (port > 65535) {
+            if (error != nullptr) {
+                *error = "tcp port is outside the valid range";
+            }
+            return false;
+        }
+        if (port > 0) {
+            if (!add_or_error(
+                    L"PktmonInterfaceTcpSource",
+                    PKTMON_PROTO_TCP,
+                    static_cast<uint16_t>(port),
+                    0) ||
+                !add_or_error(
+                    L"PktmonInterfaceTcpDestination",
+                    PKTMON_PROTO_TCP,
+                    0,
+                    static_cast<uint16_t>(port))) {
+                return false;
+            }
+        } else if (!add_or_error(L"PktmonInterfaceTcp", PKTMON_PROTO_TCP, 0, 0)) {
             return false;
         }
     }
-    return true;
-}
 
-std::vector<uint8_t> parse_hex_line(const std::string& line) {
-    std::vector<std::string> tokens;
-    std::string token;
-    for (char c : line) {
-        if (hex_value(c) >= 0) {
-            token.push_back(c);
-        } else if (!token.empty()) {
-            tokens.push_back(token);
-            token.clear();
-        }
-    }
-    if (!token.empty()) {
-        tokens.push_back(token);
-    }
-
-    if (tokens.size() < 8) {
-        return {};
-    }
-    size_t start = 0;
-    if (tokens[0].size() > 2 && is_hex_token(tokens[0])) {
-        start = 1;
-    }
-
-    std::vector<uint8_t> bytes;
-    for (size_t i = start; i < tokens.size(); ++i) {
-        if (tokens[i].size() != 2 || !is_hex_token(tokens[i])) {
-            if (bytes.size() >= 8) {
-                break;
+    if (contains_case_insensitive(lower, "udp")) {
+        int port = extract_port_after(lower, "udp port");
+        if (port > 65535) {
+            if (error != nullptr) {
+                *error = "udp port is outside the valid range";
             }
-            bytes.clear();
-            break;
+            return false;
         }
-        bytes.push_back(static_cast<uint8_t>(
-            (hex_value(tokens[i][0]) << 4) | hex_value(tokens[i][1])));
+        if (port > 0) {
+            if (!add_or_error(
+                    L"PktmonInterfaceUdpSource",
+                    PKTMON_PROTO_UDP,
+                    static_cast<uint16_t>(port),
+                    0) ||
+                !add_or_error(
+                    L"PktmonInterfaceUdpDestination",
+                    PKTMON_PROTO_UDP,
+                    0,
+                    static_cast<uint16_t>(port))) {
+                return false;
+            }
+        } else if (!add_or_error(L"PktmonInterfaceUdp", PKTMON_PROTO_UDP, 0, 0)) {
+            return false;
+        }
     }
-    return bytes.size() >= 8 ? bytes : std::vector<uint8_t>();
+
+    return true;
 }
 
 std::string ipv4_to_string(const uint8_t* data) {
@@ -550,11 +488,11 @@ bool parse_ip_packet(const std::vector<uint8_t>& packet, size_t offset, ParsedPa
     return false;
 }
 
-bool parse_packet_bytes(const std::vector<uint8_t>& bytes, ParsedPacket* out) {
+bool parse_packet_bytes(const std::vector<uint8_t>& bytes, double timestamp_unix, ParsedPacket* out) {
     if (bytes.empty() || out == nullptr) {
         return false;
     }
-    out->timestamp_unix = unix_time_now();
+    out->timestamp_unix = timestamp_unix > 0.0 ? timestamp_unix : unix_time_now();
 
     if (parse_ip_packet(bytes, 0, out)) {
         return true;
@@ -590,9 +528,9 @@ bool parse_packet_bytes(const std::vector<uint8_t>& bytes, ParsedPacket* out) {
     return false;
 }
 
-void enqueue_packet(CaptureState* state, const std::vector<uint8_t>& bytes) {
+void enqueue_packet(CaptureState* state, const std::vector<uint8_t>& bytes, double timestamp_unix = 0.0) {
     ParsedPacket packet;
-    if (!parse_packet_bytes(bytes, &packet) || packet.payload.empty()) {
+    if (!parse_packet_bytes(bytes, timestamp_unix, &packet) || packet.payload.empty()) {
         return;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -603,36 +541,58 @@ void enqueue_packet(CaptureState* state, const std::vector<uint8_t>& bytes) {
     state->ready.notify_one();
 }
 
-void enqueue_direct_view(CaptureState* state, const DirectPacketView* view) {
-    if (state == nullptr || view == nullptr || view->data == nullptr || view->data_size == 0) {
+double stream_descriptor_timestamp(const PACKETMONITOR_STREAM_DATA_DESCRIPTOR* descriptor) {
+    if (descriptor == nullptr || descriptor->Data == nullptr ||
+        descriptor->MetadataOffset == 0 ||
+        descriptor->MetadataOffset + sizeof(PACKETMONITOR_STREAM_METADATA) > descriptor->DataSize) {
+        return unix_time_now();
+    }
+
+    const auto* base = static_cast<const uint8_t*>(descriptor->Data);
+    const auto* metadata = reinterpret_cast<const PACKETMONITOR_STREAM_METADATA*>(
+        base + descriptor->MetadataOffset);
+    return unix_time_from_system_time(metadata->TimeStamp.QuadPart);
+}
+
+void enqueue_stream_data(
+    CaptureState* state,
+    const PACKETMONITOR_STREAM_DATA_DESCRIPTOR* descriptor) {
+    if (state == nullptr || descriptor == nullptr || descriptor->Data == nullptr ||
+        descriptor->DataSize == 0) {
         return;
     }
 
-    const uint32_t bounded_size = view->data_size > 262144 ? 262144 : view->data_size;
-    std::vector<uint8_t> bytes(view->data, view->data + bounded_size);
-    enqueue_packet(state, bytes);
+    const auto* data = static_cast<const uint8_t*>(descriptor->Data);
+    const uint32_t bounded_size = descriptor->DataSize > 262144 ? 262144 : descriptor->DataSize;
+    const double timestamp = stream_descriptor_timestamp(descriptor);
 
-    if (view->packet_offset > 0 && view->packet_offset < bounded_size) {
-        uint32_t payload_size = bounded_size - view->packet_offset;
-        if (view->packet_size > 0 && view->packet_size < payload_size) {
-            payload_size = view->packet_size;
+    if (descriptor->PacketOffset < bounded_size) {
+        uint32_t packet_size = bounded_size - descriptor->PacketOffset;
+        if (descriptor->PacketLength > 0 && descriptor->PacketLength < packet_size) {
+            packet_size = descriptor->PacketLength;
         }
         std::vector<uint8_t> packet_bytes(
-            view->data + view->packet_offset,
-            view->data + view->packet_offset + payload_size);
-        enqueue_packet(state, packet_bytes);
+            data + descriptor->PacketOffset,
+            data + descriptor->PacketOffset + packet_size);
+        enqueue_packet(state, packet_bytes, timestamp);
+        return;
     }
+
+    std::vector<uint8_t> bytes(data, data + bounded_size);
+    enqueue_packet(state, bytes, timestamp);
 }
 
-void WINAPI direct_packet_callback(void* context, const DirectPacketView* view) {
+void CALLBACK direct_packet_callback(
+    void* context,
+    const PACKETMONITOR_STREAM_DATA_DESCRIPTOR* descriptor) {
     auto* state = static_cast<CaptureState*>(context);
     if (state == nullptr || state->stopping.load()) {
         return;
     }
-    enqueue_direct_view(state, view);
+    enqueue_stream_data(state, descriptor);
 }
 
-void WINAPI direct_event_callback(void* context, const void*, uint32_t event_type) {
+void CALLBACK direct_event_callback(void* context, const void*, uint32_t event_type) {
     auto* state = static_cast<CaptureState*>(context);
     if (state == nullptr || event_type == 0) {
         return;
@@ -660,7 +620,12 @@ bool resolve_direct_api(HMODULE module, DirectApi* api, std::string* error) {
            resolve_export(module, "PacketMonitorCreateRealtimeStream", &api->create_stream, error) &&
            resolve_export(module, "PacketMonitorCloseRealtimeStream", &api->close_stream, error) &&
            resolve_export(module, "PacketMonitorAttachOutputToSession", &api->attach_output, error) &&
-           resolve_export(module, "PacketMonitorSetSessionActive", &api->set_active, error);
+           resolve_export(module, "PacketMonitorSetSessionActive", &api->set_active, error) &&
+           resolve_export(
+               module,
+               "PacketMonitorAddCaptureConstraint",
+               &api->add_capture_constraint,
+               error);
 }
 
 void close_direct_capture(CaptureState* state) {
@@ -698,15 +663,15 @@ void close_direct_capture(CaptureState* state) {
     }
 }
 
-bool start_direct_capture(CaptureState* state) {
+int32_t start_direct_capture(CaptureState* state, const std::string& packet_filter) {
     if (state == nullptr) {
-        return false;
+        return PKTMON_E_INVALID_ARGUMENT;
     }
 
     HMODULE module = LoadLibraryW(L"PktMonApi.dll");
     if (module == nullptr) {
         set_error(state, "LoadLibrary(PktMonApi.dll) failed");
-        return false;
+        return PKTMON_E_LOAD_DLL;
     }
     state->pktmon_api = module;
 
@@ -715,14 +680,14 @@ bool start_direct_capture(CaptureState* state) {
     if (!resolve_direct_api(module, &api, &error)) {
         set_error(state, error);
         close_direct_capture(state);
-        return false;
+        return PKTMON_E_MISSING_EXPORT;
     }
 
-    long hr = api.initialize(kPacketMonitorApiVersion, nullptr, &state->api_handle);
+    HRESULT hr = api.initialize(PACKETMONITOR_API_VERSION_1_0, nullptr, &state->api_handle);
     if (failed_hr(hr) || state->api_handle == nullptr) {
         set_error(state, hresult_message("PacketMonitorInitialize", hr));
         close_direct_capture(state);
-        return false;
+        return PKTMON_E_PROCESS;
     }
 
     wchar_t session_name[64];
@@ -731,147 +696,44 @@ bool start_direct_capture(CaptureState* state) {
     if (failed_hr(hr) || state->session_handle == nullptr) {
         set_error(state, hresult_message("PacketMonitorCreateLiveSession", hr));
         close_direct_capture(state);
-        return false;
+        return PKTMON_E_PROCESS;
     }
 
-    DirectStreamConfig config{};
-    config.context = state;
-    config.event_callback = reinterpret_cast<void*>(&direct_event_callback);
-    config.packet_callback = reinterpret_cast<void*>(&direct_packet_callback);
-    config.queue_count = 4;
-    config.packet_slots = 128;
+    if (!configure_session_constraints(api, state->session_handle, packet_filter, &error)) {
+        set_error(state, error);
+        close_direct_capture(state);
+        return PKTMON_E_PROCESS;
+    }
+
+    PACKETMONITOR_REALTIME_STREAM_CONFIGURATION config{};
+    config.UserContext = state;
+    config.EventCallback = direct_event_callback;
+    config.DataCallback = direct_packet_callback;
+    config.BufferSizeMultiplier = 4;
+    config.TruncationSize = 9000;
 
     hr = api.create_stream(state->api_handle, &config, &state->stream_handle);
     if (failed_hr(hr) || state->stream_handle == nullptr) {
         set_error(state, hresult_message("PacketMonitorCreateRealtimeStream", hr));
         close_direct_capture(state);
-        return false;
+        return PKTMON_E_PROCESS;
     }
 
     hr = api.attach_output(state->session_handle, state->stream_handle);
     if (failed_hr(hr)) {
         set_error(state, hresult_message("PacketMonitorAttachOutputToSession", hr));
         close_direct_capture(state);
-        return false;
+        return PKTMON_E_PROCESS;
     }
 
     hr = api.set_active(state->session_handle, TRUE);
     if (failed_hr(hr)) {
         set_error(state, hresult_message("PacketMonitorSetSessionActive", hr));
         close_direct_capture(state);
-        return false;
+        return PKTMON_E_PROCESS;
     }
 
-    return true;
-}
-
-void reader_main(CaptureState* state) {
-    std::string pending_line;
-    std::vector<uint8_t> current_packet;
-    char buffer[4096];
-    DWORD read = 0;
-
-    auto flush_packet = [&]() {
-        if (!current_packet.empty()) {
-            enqueue_packet(state, current_packet);
-            current_packet.clear();
-        }
-    };
-
-    while (!state->stopping.load()) {
-        BOOL ok = ReadFile(state->stdout_read, buffer, sizeof(buffer), &read, nullptr);
-        if (!ok || read == 0) {
-            break;
-        }
-        for (DWORD i = 0; i < read; ++i) {
-            char c = buffer[i];
-            if (c == '\r') {
-                continue;
-            }
-            if (c != '\n') {
-                pending_line.push_back(c);
-                continue;
-            }
-
-            std::vector<uint8_t> bytes = parse_hex_line(pending_line);
-            if (!bytes.empty()) {
-                current_packet.insert(current_packet.end(), bytes.begin(), bytes.end());
-            } else {
-                flush_packet();
-                if (contains_case_insensitive(pending_line, "access is denied") ||
-                    contains_case_insensitive(pending_line, "拒绝访问")) {
-                    set_error(state, "pktmon requires an elevated Administrator process");
-                }
-            }
-            pending_line.clear();
-        }
-    }
-    flush_packet();
-}
-
-bool start_realtime_process(CaptureState* state) {
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    if (!CreatePipe(&state->stdout_read, &state->stdout_write, &sa, 0)) {
-        set_error(state, "CreatePipe failed");
-        return false;
-    }
-    SetHandleInformation(state->stdout_read, HANDLE_FLAG_INHERIT, 0);
-
-    std::wstring command =
-        L"pktmon.exe start --capture --comp nics --pkt-size 0 --flags 0x10 --log-mode real-time";
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = state->stdout_write;
-    si.hStdError = state->stdout_write;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(
-        nullptr,
-        command.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        nullptr,
-        &si,
-        &pi);
-    CloseHandle(state->stdout_write);
-    state->stdout_write = nullptr;
-    if (!ok) {
-        set_error(state, "CreateProcess(pktmon start) failed");
-        CloseHandle(state->stdout_read);
-        state->stdout_read = nullptr;
-        return false;
-    }
-    state->process = pi.hProcess;
-    state->thread = pi.hThread;
-    state->reader = std::thread(reader_main, state);
-    return true;
-}
-
-void close_process_handles(CaptureState* state) {
-    if (state->stdout_write != nullptr) {
-        CloseHandle(state->stdout_write);
-        state->stdout_write = nullptr;
-    }
-    if (state->stdout_read != nullptr) {
-        CloseHandle(state->stdout_read);
-        state->stdout_read = nullptr;
-    }
-    if (state->thread != nullptr) {
-        CloseHandle(state->thread);
-        state->thread = nullptr;
-    }
-    if (state->process != nullptr) {
-        CloseHandle(state->process);
-        state->process = nullptr;
-    }
+    return PKTMON_OK;
 }
 
 void stop_capture(CaptureState* state) {
@@ -880,22 +742,6 @@ void stop_capture(CaptureState* state) {
     }
     state->stopping.store(true);
     close_direct_capture(state);
-    if (state->process != nullptr) {
-        run_pktmon_command(L"stop", nullptr);
-    }
-    if (state->process != nullptr) {
-        WaitForSingleObject(state->process, 3000);
-        DWORD code = STILL_ACTIVE;
-        GetExitCodeProcess(state->process, &code);
-        if (code == STILL_ACTIVE) {
-            TerminateProcess(state->process, 1);
-        }
-    }
-    if (state->reader.joinable()) {
-        state->reader.join();
-    }
-    run_pktmon_command(L"filter remove", nullptr);
-    close_process_handles(state);
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->started = false;
@@ -918,13 +764,12 @@ PKTMON_EXPORT int32_t PktmonProbe(PktmonProbeInfo* info) {
     ExportProbe probe = probe_exports();
     info->export_count = static_cast<uint32_t>(kPktmonExports.size());
     info->missing_count = static_cast<uint32_t>(probe.missing.size());
-    info->capture_ready = 1;
-    info->reserved = 0;
-
     const int32_t status =
         probe.module == nullptr
             ? PKTMON_E_LOAD_DLL
             : (probe.missing.empty() ? PKTMON_OK : PKTMON_E_MISSING_EXPORT);
+    info->capture_ready = status == PKTMON_OK ? 1 : 0;
+    info->reserved = 0;
 
     if (probe.module != nullptr) {
         FreeLibrary(probe.module);
@@ -958,25 +803,10 @@ PKTMON_EXPORT int32_t PktmonStart(PktmonHandle handle, const char* filter) {
     }
 
     const std::string packet_filter = filter != nullptr ? filter : "";
-    std::string error;
-    if (!configure_filters(packet_filter, &error)) {
-        set_error(state, error);
-        return PKTMON_E_PROCESS;
-    }
-
     state->stopping.store(false);
-    char mode_buffer[32]{};
-    DWORD mode_len = GetEnvironmentVariableA("PKTMON_BACKEND", mode_buffer, sizeof(mode_buffer));
-    const bool use_exe_backend =
-        mode_len > 0 && contains_case_insensitive(std::string(mode_buffer), "exe");
-    if (use_exe_backend) {
-        if (!start_realtime_process(state)) {
-            run_pktmon_command(L"filter remove", nullptr);
-            return PKTMON_E_PROCESS;
-        }
-    } else if (!start_direct_capture(state)) {
-        run_pktmon_command(L"filter remove", nullptr);
-        return PKTMON_E_PROCESS;
+    int32_t status = start_direct_capture(state, packet_filter);
+    if (status != PKTMON_OK) {
+        return status;
     }
     {
         std::lock_guard<std::mutex> lock(state->mutex);
