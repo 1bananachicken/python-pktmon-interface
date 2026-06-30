@@ -28,6 +28,7 @@ class PktmonSniffer:
         truncation_size: int = 9000,
         include_empty_payloads: bool = True,
         drain_batch_size: int = 64,
+        callback_batch_size: int = 0,
     ) -> None:
         self.filter = filter
         self.prn = prn
@@ -38,6 +39,7 @@ class PktmonSniffer:
         self.truncation_size = max(int(truncation_size), 1)
         self.include_empty_payloads = bool(include_empty_payloads)
         self.drain_batch_size = max(int(drain_batch_size), 1)
+        self.callback_batch_size = max(int(callback_batch_size), 0)
         self._backend = backend
         self._owns_backend = backend is None
         self._packets: list[CapturedPacket] = []
@@ -46,6 +48,11 @@ class PktmonSniffer:
         self._stopping = threading.Event()
         self._started = False
         self._error: BaseException | None = None
+        self._callback_error: BaseException | None = None
+
+    @property
+    def callback_error(self) -> BaseException | None:
+        return self._callback_error
 
     @property
     def results(self) -> list[CapturedPacket]:
@@ -68,6 +75,7 @@ class PktmonSniffer:
         )
         self._backend = backend
         self._error = None
+        self._callback_error = None
         self._stopping.clear()
         self._started = True
         self._thread = threading.Thread(target=self._run, name="PktmonSniffer", daemon=True)
@@ -83,11 +91,16 @@ class PktmonSniffer:
                 )
                 if not packets:
                     continue
+                if self.callback_batch_size > 0 and len(packets) > self.callback_batch_size:
+                    packets = packets[-self.callback_batch_size :]
                 for packet in packets:
                     if self.store:
                         self._packets.append(packet)
                     if self.prn is not None:
-                        self.prn(packet)
+                        try:
+                            self.prn(packet)
+                        except Exception as exc:
+                            self._callback_error = exc
                     try:
                         self._queue.put_nowait(packet)
                     except queue.Full:
