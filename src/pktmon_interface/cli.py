@@ -50,7 +50,13 @@ def command_packets(args: argparse.Namespace) -> int:
             print(json.dumps(backend.probe(), ensure_ascii=False, indent=2), flush=True)
         print("starting pktmon packet capture; run as Administrator", flush=True)
         try:
-            backend.start(args.filter)
+            backend.start(
+                args.filter,
+                queue_capacity=args.queue_size,
+                buffer_size_multiplier=args.buffer_size_multiplier,
+                truncation_size=args.truncation_size,
+                include_empty_payloads=not args.payload_only,
+            )
         except Exception as exc:
             print("failed to start capture: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
             return 2
@@ -79,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     packets.add_argument("--filter", default=DEFAULT_FILTER)
     packets.add_argument("--timeout", type=float, default=30.0)
     packets.add_argument("--hex", type=int, default=32)
+    packets.add_argument("--queue-size", type=int, default=8192)
+    packets.add_argument("--buffer-size-multiplier", type=int, default=16)
+    packets.add_argument("--truncation-size", type=int, default=9000)
+    packets.add_argument("--payload-only", action="store_true")
     packets.add_argument("--probe", action="store_true")
     packets.set_defaults(func=command_packets)
     return parser

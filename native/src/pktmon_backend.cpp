@@ -19,7 +19,10 @@
 
 namespace {
 
-constexpr int32_t kVersion = 3;
+constexpr int32_t kVersion = 4;
+constexpr uint32_t kDefaultQueueCapacity = 8192;
+constexpr uint16_t kDefaultBufferSizeMultiplier = 16;
+constexpr uint16_t kDefaultTruncationSize = 9000;
 
 constexpr std::array<const char*, 9> kPktmonExports = {
     "PacketMonitorAddCaptureConstraint",
@@ -49,6 +52,10 @@ struct CaptureState {
     std::deque<ParsedPacket> queue;
     std::vector<uint8_t> read_payload;
     std::atomic<bool> stopping = false;
+    uint32_t queue_capacity = kDefaultQueueCapacity;
+    uint16_t buffer_size_multiplier = kDefaultBufferSizeMultiplier;
+    uint16_t truncation_size = kDefaultTruncationSize;
+    bool include_empty_payloads = true;
     bool started = false;
     HMODULE pktmon_api = nullptr;
     PACKETMONITOR_HANDLE api_handle = nullptr;
@@ -530,11 +537,16 @@ bool parse_packet_bytes(const std::vector<uint8_t>& bytes, double timestamp_unix
 
 void enqueue_packet(CaptureState* state, const std::vector<uint8_t>& bytes, double timestamp_unix = 0.0) {
     ParsedPacket packet;
-    if (!parse_packet_bytes(bytes, timestamp_unix, &packet) || packet.payload.empty()) {
+    if (!parse_packet_bytes(bytes, timestamp_unix, &packet)) {
         return;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->queue.size() >= 512) {
+    if (!state->include_empty_payloads && packet.payload.empty()) {
+        return;
+    }
+    const uint32_t queue_capacity =
+        state->queue_capacity > 0 ? state->queue_capacity : kDefaultQueueCapacity;
+    while (state->queue.size() >= queue_capacity) {
         state->queue.pop_front();
     }
     state->queue.push_back(std::move(packet));
@@ -709,8 +721,8 @@ int32_t start_direct_capture(CaptureState* state, const std::string& packet_filt
     config.UserContext = state;
     config.EventCallback = direct_event_callback;
     config.DataCallback = direct_packet_callback;
-    config.BufferSizeMultiplier = 4;
-    config.TruncationSize = 9000;
+    config.BufferSizeMultiplier = state->buffer_size_multiplier;
+    config.TruncationSize = state->truncation_size;
 
     hr = api.create_stream(state->api_handle, &config, &state->stream_handle);
     if (failed_hr(hr) || state->stream_handle == nullptr) {
@@ -748,6 +760,32 @@ void stop_capture(CaptureState* state) {
         state->queue.clear();
     }
     state->ready.notify_all();
+}
+
+void apply_capture_config(CaptureState* state, const PktmonCaptureConfig* config) {
+    if (state == nullptr) {
+        return;
+    }
+
+    state->queue_capacity = kDefaultQueueCapacity;
+    state->buffer_size_multiplier = kDefaultBufferSizeMultiplier;
+    state->truncation_size = kDefaultTruncationSize;
+    state->include_empty_payloads = true;
+
+    if (config == nullptr || config->struct_size != sizeof(PktmonCaptureConfig)) {
+        return;
+    }
+
+    if (config->queue_capacity > 0) {
+        state->queue_capacity = config->queue_capacity;
+    }
+    if (config->buffer_size_multiplier > 0) {
+        state->buffer_size_multiplier = config->buffer_size_multiplier;
+    }
+    if (config->truncation_size > 0) {
+        state->truncation_size = config->truncation_size;
+    }
+    state->include_empty_payloads = config->include_empty_payloads != 0;
 }
 
 }  // namespace
@@ -794,6 +832,19 @@ PKTMON_EXPORT void PktmonDestroy(PktmonHandle handle) {
 }
 
 PKTMON_EXPORT int32_t PktmonStart(PktmonHandle handle, const char* filter) {
+    PktmonCaptureConfig config{};
+    config.struct_size = sizeof(PktmonCaptureConfig);
+    config.queue_capacity = kDefaultQueueCapacity;
+    config.buffer_size_multiplier = kDefaultBufferSizeMultiplier;
+    config.truncation_size = kDefaultTruncationSize;
+    config.include_empty_payloads = 1;
+    return PktmonStartConfig(handle, filter, &config);
+}
+
+PKTMON_EXPORT int32_t PktmonStartConfig(
+    PktmonHandle handle,
+    const char* filter,
+    const PktmonCaptureConfig* config) {
     auto* state = static_cast<CaptureState*>(handle);
     if (state == nullptr) {
         return PKTMON_E_INVALID_ARGUMENT;
@@ -804,6 +855,7 @@ PKTMON_EXPORT int32_t PktmonStart(PktmonHandle handle, const char* filter) {
 
     const std::string packet_filter = filter != nullptr ? filter : "";
     state->stopping.store(false);
+    apply_capture_config(state, config);
     int32_t status = start_direct_capture(state, packet_filter);
     if (status != PKTMON_OK) {
         return status;

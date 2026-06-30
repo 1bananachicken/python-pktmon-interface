@@ -47,6 +47,15 @@ struct PktmonPacket {
     uint32_t payload_size;
 };
 
+struct PktmonCaptureConfig {
+    uint32_t struct_size;
+    uint32_t queue_capacity;
+    uint16_t buffer_size_multiplier;
+    uint16_t truncation_size;
+    uint8_t include_empty_payloads;
+    uint8_t reserved[5];
+};
+
 using PktmonHandle = void*;
 
 PKTMON_EXPORT int32_t PktmonVersion();
@@ -55,6 +64,10 @@ PKTMON_EXPORT uint32_t PktmonGetExportReport(char* buffer, uint32_t buffer_size)
 PKTMON_EXPORT PktmonHandle PktmonCreate();
 PKTMON_EXPORT void PktmonDestroy(PktmonHandle handle);
 PKTMON_EXPORT int32_t PktmonStart(PktmonHandle handle, const char* filter);
+PKTMON_EXPORT int32_t PktmonStartConfig(
+    PktmonHandle handle,
+    const char* filter,
+    const PktmonCaptureConfig* config);
 PKTMON_EXPORT int32_t PktmonRead(PktmonHandle handle, PktmonPacket* packet, uint32_t timeout_ms);
 PKTMON_EXPORT void PktmonStop(PktmonHandle handle);
 PKTMON_EXPORT uint32_t PktmonLastError(PktmonHandle handle, char* buffer, uint32_t buffer_size);

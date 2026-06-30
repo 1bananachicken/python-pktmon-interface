@@ -39,6 +39,17 @@ class NativePacket(ctypes.Structure):
     ]
 
 
+class CaptureConfig(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("queue_capacity", ctypes.c_uint32),
+        ("buffer_size_multiplier", ctypes.c_uint16),
+        ("truncation_size", ctypes.c_uint16),
+        ("include_empty_payloads", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 5),
+    ]
+
+
 class PktmonBackend:
     def __init__(self, dll_path: str | Path | None = None) -> None:
         if dll_path is None:
@@ -74,6 +85,15 @@ class PktmonBackend:
 
         dll.PktmonStart.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         dll.PktmonStart.restype = ctypes.c_int32
+
+        self._start_config = getattr(dll, "PktmonStartConfig", None)
+        if self._start_config is not None:
+            self._start_config.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.POINTER(CaptureConfig),
+            ]
+            self._start_config.restype = ctypes.c_int32
 
         dll.PktmonRead.argtypes = [
             ctypes.c_void_p,
@@ -131,13 +151,32 @@ class PktmonBackend:
             "report": report,
         }
 
-    def start(self, packet_filter: str = "tcp port 30031 or udp") -> None:
-        status = int(
-            self._dll.PktmonStart(
-                self._handle,
-                packet_filter.encode("utf-8"),
+    def start(
+        self,
+        packet_filter: str = "tcp port 30031 or udp",
+        *,
+        queue_capacity: int = 8192,
+        buffer_size_multiplier: int = 16,
+        truncation_size: int = 9000,
+        include_empty_payloads: bool = True,
+    ) -> None:
+        encoded_filter = packet_filter.encode("utf-8")
+        if self._start_config is not None:
+            config = CaptureConfig()
+            config.struct_size = ctypes.sizeof(CaptureConfig)
+            config.queue_capacity = max(int(queue_capacity), 1)
+            config.buffer_size_multiplier = min(max(int(buffer_size_multiplier), 1), 65535)
+            config.truncation_size = min(max(int(truncation_size), 1), 65535)
+            config.include_empty_payloads = 1 if include_empty_payloads else 0
+            status = int(
+                self._start_config(
+                    self._handle,
+                    encoded_filter,
+                    ctypes.byref(config),
+                )
             )
-        )
+        else:
+            status = int(self._dll.PktmonStart(self._handle, encoded_filter))
         if status != PKTMON_OK:
             raise RuntimeError("PktmonStart failed: %s" % self.last_error())
 

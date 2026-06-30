@@ -89,6 +89,26 @@ finally:
     sniffer.stop()
 ```
 
+Capture tuning:
+
+```python
+sniffer = PktmonSniffer(
+    filter="udp",
+    store=False,
+    queue_size=8192,
+    native_queue_capacity=8192,
+    buffer_size_multiplier=16,
+    truncation_size=9000,
+    include_empty_payloads=True,
+)
+```
+
+`include_empty_payloads=True` counts TCP/UDP packets with no payload, such as
+TCP ACK and handshake packets. This usually makes packet event counts closer to
+Scapy. Set it to `False` to keep the older payload-only behavior. For higher
+event rates, keep callback work small, use `store=False`, and lower
+`truncation_size` if you only need packet metadata instead of full payloads.
+
 Synchronous reads:
 
 ```python
@@ -96,7 +116,12 @@ from pktmon_interface import PktmonBackend
 
 with PktmonBackend() as backend:
     print(backend.probe())
-    backend.start("tcp port 30031 or udp")
+    backend.start(
+        "tcp port 30031 or udp",
+        queue_capacity=8192,
+        buffer_size_multiplier=16,
+        include_empty_payloads=True,
+    )
     packet = backend.read(timeout_ms=500)
     if packet is not None:
         print(packet.protocol_name, packet.source, packet.destination, len(packet.payload))
@@ -117,6 +142,7 @@ with PktmonSniffer(filter="udp", store=False) as sniffer:
 ```powershell
 pktmon-interface probe
 pktmon-interface packets --timeout 30 --probe
+pktmon-interface packets --timeout 30 --queue-size 8192 --buffer-size-multiplier 16
 ```
 
 The native backend defaults to the documented `PktMonApi.dll` realtime stream

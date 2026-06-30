@@ -22,12 +22,20 @@ class PktmonSniffer:
         store: bool = True,
         backend: PktmonBackend | None = None,
         read_timeout_ms: int = 100,
-        queue_size: int = 1024,
+        queue_size: int = 8192,
+        native_queue_capacity: int = 8192,
+        buffer_size_multiplier: int = 16,
+        truncation_size: int = 9000,
+        include_empty_payloads: bool = True,
     ) -> None:
         self.filter = filter
         self.prn = prn
         self.store = store
         self.read_timeout_ms = max(int(read_timeout_ms), 1)
+        self.native_queue_capacity = max(int(native_queue_capacity), 1)
+        self.buffer_size_multiplier = max(int(buffer_size_multiplier), 1)
+        self.truncation_size = max(int(truncation_size), 1)
+        self.include_empty_payloads = bool(include_empty_payloads)
         self._backend = backend
         self._owns_backend = backend is None
         self._packets: list[CapturedPacket] = []
@@ -49,7 +57,13 @@ class PktmonSniffer:
         if self._started:
             return
         backend = self._backend or PktmonBackend()
-        backend.start(self.filter)
+        backend.start(
+            self.filter,
+            queue_capacity=self.native_queue_capacity,
+            buffer_size_multiplier=self.buffer_size_multiplier,
+            truncation_size=self.truncation_size,
+            include_empty_payloads=self.include_empty_payloads,
+        )
         self._backend = backend
         self._error = None
         self._stopping.clear()

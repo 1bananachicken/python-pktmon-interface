@@ -35,8 +35,27 @@ def test_captured_packet_protocol_and_flow() -> None:
 
 
 def test_cli_parser_accepts_packets_command() -> None:
-    args = build_parser().parse_args(["packets", "--timeout", "1", "--hex", "8"])
+    args = build_parser().parse_args(
+        [
+            "packets",
+            "--timeout",
+            "1",
+            "--hex",
+            "8",
+            "--queue-size",
+            "4096",
+            "--buffer-size-multiplier",
+            "8",
+            "--truncation-size",
+            "256",
+            "--payload-only",
+        ]
+    )
 
     assert args.command == "packets"
     assert args.timeout == 1
     assert args.hex == 8
+    assert args.queue_size == 4096
+    assert args.buffer_size_multiplier == 8
+    assert args.truncation_size == 256
+    assert args.payload_only is True
