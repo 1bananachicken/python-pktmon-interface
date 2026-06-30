@@ -24,9 +24,10 @@ class PktmonSniffer:
         read_timeout_ms: int = 100,
         queue_size: int = 8192,
         native_queue_capacity: int = 8192,
-        buffer_size_multiplier: int = 16,
+        buffer_size_multiplier: int = 1,
         truncation_size: int = 9000,
         include_empty_payloads: bool = True,
+        drain_batch_size: int = 64,
     ) -> None:
         self.filter = filter
         self.prn = prn
@@ -36,6 +37,7 @@ class PktmonSniffer:
         self.buffer_size_multiplier = max(int(buffer_size_multiplier), 1)
         self.truncation_size = max(int(truncation_size), 1)
         self.include_empty_payloads = bool(include_empty_payloads)
+        self.drain_batch_size = max(int(drain_batch_size), 1)
         self._backend = backend
         self._owns_backend = backend is None
         self._packets: list[CapturedPacket] = []
@@ -75,17 +77,21 @@ class PktmonSniffer:
         assert self._backend is not None
         try:
             while not self._stopping.is_set():
-                packet = self._backend.read(timeout_ms=self.read_timeout_ms)
-                if packet is None:
+                packets = self._backend.read_many(
+                    max_packets=self.drain_batch_size,
+                    timeout_ms=self.read_timeout_ms,
+                )
+                if not packets:
                     continue
-                if self.store:
-                    self._packets.append(packet)
-                if self.prn is not None:
-                    self.prn(packet)
-                try:
-                    self._queue.put_nowait(packet)
-                except queue.Full:
-                    pass
+                for packet in packets:
+                    if self.store:
+                        self._packets.append(packet)
+                    if self.prn is not None:
+                        self.prn(packet)
+                    try:
+                        self._queue.put_nowait(packet)
+                    except queue.Full:
+                        pass
         except BaseException as exc:
             self._error = exc
 

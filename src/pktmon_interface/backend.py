@@ -102,6 +102,17 @@ class PktmonBackend:
         ]
         dll.PktmonRead.restype = ctypes.c_int32
 
+        self._read_batch = getattr(dll, "PktmonReadBatch", None)
+        if self._read_batch is not None:
+            self._read_batch.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(NativePacket),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            self._read_batch.restype = ctypes.c_int32
+
         dll.PktmonStop.argtypes = [ctypes.c_void_p]
         dll.PktmonStop.restype = None
 
@@ -156,7 +167,7 @@ class PktmonBackend:
         packet_filter: str = "tcp port 30031 or udp",
         *,
         queue_capacity: int = 8192,
-        buffer_size_multiplier: int = 16,
+        buffer_size_multiplier: int = 1,
         truncation_size: int = 9000,
         include_empty_payloads: bool = True,
     ) -> None:
@@ -188,7 +199,53 @@ class PktmonBackend:
             return None
         if status != PKTMON_OK:
             raise RuntimeError("PktmonRead failed: %s" % self.last_error())
-        payload = ctypes.string_at(packet.payload, packet.payload_size)
+        return self._packet_from_native(packet)
+
+    def read_many(self, max_packets: int = 64, timeout_ms: int = 100) -> list[CapturedPacket]:
+        limit = max(int(max_packets), 1)
+        if self._read_batch is not None:
+            native_packets = (NativePacket * limit)()
+            struct_size = ctypes.sizeof(NativePacket)
+            for packet in native_packets:
+                packet.struct_size = struct_size
+            packets_read = ctypes.c_uint32(0)
+            status = int(
+                self._read_batch(
+                    self._handle,
+                    native_packets,
+                    limit,
+                    timeout_ms,
+                    ctypes.byref(packets_read),
+                )
+            )
+            if status in {PKTMON_E_NOT_STARTED, PKTMON_E_TIMEOUT}:
+                return []
+            if status != PKTMON_OK:
+                raise RuntimeError("PktmonReadBatch failed: %s" % self.last_error())
+            return [
+                self._packet_from_native(native_packets[index])
+                for index in range(int(packets_read.value))
+            ]
+
+        first = self.read(timeout_ms=timeout_ms)
+        if first is None:
+            return []
+
+        packets = [first]
+        while len(packets) < limit:
+            packet = self.read(timeout_ms=0)
+            if packet is None:
+                break
+            packets.append(packet)
+        return packets
+
+    @staticmethod
+    def _packet_from_native(packet: NativePacket) -> CapturedPacket:
+        payload = (
+            b""
+            if packet.payload_size == 0
+            else ctypes.string_at(packet.payload, packet.payload_size)
+        )
         return CapturedPacket(
             timestamp=float(packet.timestamp_unix),
             protocol=int(packet.protocol),

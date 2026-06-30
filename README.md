@@ -97,9 +97,10 @@ sniffer = PktmonSniffer(
     store=False,
     queue_size=8192,
     native_queue_capacity=8192,
-    buffer_size_multiplier=16,
+    buffer_size_multiplier=1,
     truncation_size=9000,
     include_empty_payloads=True,
+    drain_batch_size=64,
 )
 ```
 
@@ -108,6 +109,8 @@ TCP ACK and handshake packets. This usually makes packet event counts closer to
 Scapy. Set it to `False` to keep the older payload-only behavior. For higher
 event rates, keep callback work small, use `store=False`, and lower
 `truncation_size` if you only need packet metadata instead of full payloads.
+`buffer_size_multiplier=1` favors low latency; increase it if you see packet
+drops under bursts.
 
 Synchronous reads:
 
@@ -119,7 +122,7 @@ with PktmonBackend() as backend:
     backend.start(
         "tcp port 30031 or udp",
         queue_capacity=8192,
-        buffer_size_multiplier=16,
+        buffer_size_multiplier=1,
         include_empty_payloads=True,
     )
     packet = backend.read(timeout_ms=500)
@@ -142,7 +145,7 @@ with PktmonSniffer(filter="udp", store=False) as sniffer:
 ```powershell
 pktmon-interface probe
 pktmon-interface packets --timeout 30 --probe
-pktmon-interface packets --timeout 30 --queue-size 8192 --buffer-size-multiplier 16
+pktmon-interface packets --timeout 30 --queue-size 8192 --buffer-size-multiplier 1
 ```
 
 The native backend defaults to the documented `PktMonApi.dll` realtime stream

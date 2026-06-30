@@ -63,11 +63,16 @@ def command_packets(args: argparse.Namespace) -> int:
         print("printing parsed packets; press Ctrl+C to stop", flush=True)
         try:
             while deadline is None or time.monotonic() < deadline:
-                packet = backend.read(timeout_ms=500)
-                if packet is None:
+                packets = backend.read_many(
+                    max_packets=args.drain_batch_size,
+                    timeout_ms=args.read_timeout_ms,
+                )
+                if not packets:
                     continue
-                count += 1
-                print(_format_packet(count, packet, args.hex), flush=True)
+                for packet in packets:
+                    count += 1
+                    print(_format_packet(count, packet, args.hex), flush=False)
+                sys.stdout.flush()
         except KeyboardInterrupt:
             print("stopping", flush=True)
     if count == 0:
@@ -86,8 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     packets.add_argument("--timeout", type=float, default=30.0)
     packets.add_argument("--hex", type=int, default=32)
     packets.add_argument("--queue-size", type=int, default=8192)
-    packets.add_argument("--buffer-size-multiplier", type=int, default=16)
+    packets.add_argument("--buffer-size-multiplier", type=int, default=1)
     packets.add_argument("--truncation-size", type=int, default=9000)
+    packets.add_argument("--read-timeout-ms", type=int, default=50)
+    packets.add_argument("--drain-batch-size", type=int, default=64)
     packets.add_argument("--payload-only", action="store_true")
     packets.add_argument("--probe", action="store_true")
     packets.set_defaults(func=command_packets)

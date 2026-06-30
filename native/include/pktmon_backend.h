@@ -69,6 +69,12 @@ PKTMON_EXPORT int32_t PktmonStartConfig(
     const char* filter,
     const PktmonCaptureConfig* config);
 PKTMON_EXPORT int32_t PktmonRead(PktmonHandle handle, PktmonPacket* packet, uint32_t timeout_ms);
+PKTMON_EXPORT int32_t PktmonReadBatch(
+    PktmonHandle handle,
+    PktmonPacket* packets,
+    uint32_t packet_count,
+    uint32_t timeout_ms,
+    uint32_t* packets_read);
 PKTMON_EXPORT void PktmonStop(PktmonHandle handle);
 PKTMON_EXPORT uint32_t PktmonLastError(PktmonHandle handle, char* buffer, uint32_t buffer_size);
 

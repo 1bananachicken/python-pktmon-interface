@@ -9,7 +9,7 @@ from pktmon_interface.models import CapturedPacket
 
 
 def test_version_is_exported() -> None:
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.2.0"
 
 
 def test_default_dll_path_honors_environment(monkeypatch) -> None:
@@ -48,6 +48,10 @@ def test_cli_parser_accepts_packets_command() -> None:
             "8",
             "--truncation-size",
             "256",
+            "--read-timeout-ms",
+            "25",
+            "--drain-batch-size",
+            "32",
             "--payload-only",
         ]
     )
@@ -58,4 +62,6 @@ def test_cli_parser_accepts_packets_command() -> None:
     assert args.queue_size == 4096
     assert args.buffer_size_multiplier == 8
     assert args.truncation_size == 256
+    assert args.read_timeout_ms == 25
+    assert args.drain_batch_size == 32
     assert args.payload_only is True

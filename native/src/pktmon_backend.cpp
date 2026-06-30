@@ -21,7 +21,7 @@ namespace {
 
 constexpr int32_t kVersion = 4;
 constexpr uint32_t kDefaultQueueCapacity = 8192;
-constexpr uint16_t kDefaultBufferSizeMultiplier = 16;
+constexpr uint16_t kDefaultBufferSizeMultiplier = 1;
 constexpr uint16_t kDefaultTruncationSize = 9000;
 
 constexpr std::array<const char*, 9> kPktmonExports = {
@@ -51,6 +51,7 @@ struct CaptureState {
     std::condition_variable ready;
     std::deque<ParsedPacket> queue;
     std::vector<uint8_t> read_payload;
+    std::vector<std::vector<uint8_t>> read_batch_payloads;
     std::atomic<bool> stopping = false;
     uint32_t queue_capacity = kDefaultQueueCapacity;
     uint16_t buffer_size_multiplier = kDefaultBufferSizeMultiplier;
@@ -408,23 +409,23 @@ uint16_t read_be16(const uint8_t* data) {
     return static_cast<uint16_t>((data[0] << 8) | data[1]);
 }
 
-bool parse_ip_packet(const std::vector<uint8_t>& packet, size_t offset, ParsedPacket* out) {
-    if (offset >= packet.size()) {
+bool parse_ip_packet(const uint8_t* packet, size_t packet_size, size_t offset, ParsedPacket* out) {
+    if (offset >= packet_size) {
         return false;
     }
     const uint8_t version = packet[offset] >> 4;
     if (version == 4) {
-        if (offset + 20 > packet.size()) {
+        if (offset + 20 > packet_size) {
             return false;
         }
         const uint8_t ihl = static_cast<uint8_t>((packet[offset] & 0x0f) * 4);
-        if (ihl < 20 || offset + ihl > packet.size()) {
+        if (ihl < 20 || offset + ihl > packet_size) {
             return false;
         }
         const uint16_t total_length = read_be16(&packet[offset + 2]);
         const uint8_t proto = packet[offset + 9];
-        size_t end = packet.size();
-        if (total_length >= ihl && offset + total_length <= packet.size()) {
+        size_t end = packet_size;
+        if (total_length >= ihl && offset + total_length <= packet_size) {
             end = offset + total_length;
         }
         size_t transport = offset + ihl;
@@ -438,14 +439,14 @@ bool parse_ip_packet(const std::vector<uint8_t>& packet, size_t offset, ParsedPa
             }
             out->source_port = read_be16(&packet[transport]);
             out->destination_port = read_be16(&packet[transport + 2]);
-            out->payload.assign(packet.begin() + transport + tcp_header, packet.begin() + end);
+            out->payload.assign(packet + transport + tcp_header, packet + end);
         } else if (proto == PKTMON_PROTO_UDP) {
             if (transport + 8 > end) {
                 return false;
             }
             out->source_port = read_be16(&packet[transport]);
             out->destination_port = read_be16(&packet[transport + 2]);
-            out->payload.assign(packet.begin() + transport + 8, packet.begin() + end);
+            out->payload.assign(packet + transport + 8, packet + end);
         } else {
             return false;
         }
@@ -456,14 +457,14 @@ bool parse_ip_packet(const std::vector<uint8_t>& packet, size_t offset, ParsedPa
     }
 
     if (version == 6) {
-        if (offset + 40 > packet.size()) {
+        if (offset + 40 > packet_size) {
             return false;
         }
         uint8_t proto = packet[offset + 6];
         const uint16_t payload_length = read_be16(&packet[offset + 4]);
         size_t end = offset + 40 + payload_length;
-        if (end > packet.size()) {
-            end = packet.size();
+        if (end > packet_size) {
+            end = packet_size;
         }
         size_t transport = offset + 40;
         if (proto == PKTMON_PROTO_TCP) {
@@ -476,14 +477,14 @@ bool parse_ip_packet(const std::vector<uint8_t>& packet, size_t offset, ParsedPa
             }
             out->source_port = read_be16(&packet[transport]);
             out->destination_port = read_be16(&packet[transport + 2]);
-            out->payload.assign(packet.begin() + transport + tcp_header, packet.begin() + end);
+            out->payload.assign(packet + transport + tcp_header, packet + end);
         } else if (proto == PKTMON_PROTO_UDP) {
             if (transport + 8 > end) {
                 return false;
             }
             out->source_port = read_be16(&packet[transport]);
             out->destination_port = read_be16(&packet[transport + 2]);
-            out->payload.assign(packet.begin() + transport + 8, packet.begin() + end);
+            out->payload.assign(packet + transport + 8, packet + end);
         } else {
             return false;
         }
@@ -495,49 +496,54 @@ bool parse_ip_packet(const std::vector<uint8_t>& packet, size_t offset, ParsedPa
     return false;
 }
 
-bool parse_packet_bytes(const std::vector<uint8_t>& bytes, double timestamp_unix, ParsedPacket* out) {
-    if (bytes.empty() || out == nullptr) {
+bool parse_packet_bytes(const uint8_t* bytes, size_t byte_count, double timestamp_unix, ParsedPacket* out) {
+    if (bytes == nullptr || byte_count == 0 || out == nullptr) {
         return false;
     }
     out->timestamp_unix = timestamp_unix > 0.0 ? timestamp_unix : unix_time_now();
 
-    if (parse_ip_packet(bytes, 0, out)) {
+    if (parse_ip_packet(bytes, byte_count, 0, out)) {
         return true;
     }
-    if (bytes.size() >= 14) {
+    if (byte_count >= 14) {
         uint16_t ethertype = read_be16(&bytes[12]);
         size_t offset = 14;
-        if (ethertype == 0x8100 && bytes.size() >= 18) {
+        if (ethertype == 0x8100 && byte_count >= 18) {
             ethertype = read_be16(&bytes[16]);
             offset = 18;
         }
-        if ((ethertype == 0x0800 || ethertype == 0x86dd) && parse_ip_packet(bytes, offset, out)) {
+        if ((ethertype == 0x0800 || ethertype == 0x86dd) &&
+            parse_ip_packet(bytes, byte_count, offset, out)) {
             return true;
         }
     }
-    for (size_t i = 0; i + 8 < bytes.size() && i < 128; ++i) {
+    for (size_t i = 0; i + 8 < byte_count && i < 128; ++i) {
         if (bytes[i] == 0xaa && bytes[i + 1] == 0xaa && bytes[i + 2] == 0x03 &&
             bytes[i + 3] == 0x00 && bytes[i + 4] == 0x00 && bytes[i + 5] == 0x00) {
             const uint16_t ethertype = read_be16(&bytes[i + 6]);
             const size_t offset = i + 8;
             if ((ethertype == 0x0800 || ethertype == 0x86dd) &&
-                parse_ip_packet(bytes, offset, out)) {
+                parse_ip_packet(bytes, byte_count, offset, out)) {
                 return true;
             }
         }
     }
-    for (size_t i = 0; i + 20 < bytes.size() && i < 160; ++i) {
+    for (size_t i = 0; i + 20 < byte_count && i < 160; ++i) {
         const uint8_t version = bytes[i] >> 4;
-        if ((version == 4 || version == 6) && parse_ip_packet(bytes, i, out)) {
+        if ((version == 4 || version == 6) && parse_ip_packet(bytes, byte_count, i, out)) {
             return true;
         }
     }
     return false;
 }
 
-void enqueue_packet(CaptureState* state, const std::vector<uint8_t>& bytes, double timestamp_unix = 0.0) {
+void enqueue_packet(
+    CaptureState* state,
+    const uint8_t* bytes,
+    size_t byte_count,
+    double timestamp_unix = 0.0) {
     ParsedPacket packet;
-    if (!parse_packet_bytes(bytes, timestamp_unix, &packet)) {
+    if (!parse_packet_bytes(bytes, byte_count, timestamp_unix, &packet)) {
         return;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -583,15 +589,11 @@ void enqueue_stream_data(
         if (descriptor->PacketLength > 0 && descriptor->PacketLength < packet_size) {
             packet_size = descriptor->PacketLength;
         }
-        std::vector<uint8_t> packet_bytes(
-            data + descriptor->PacketOffset,
-            data + descriptor->PacketOffset + packet_size);
-        enqueue_packet(state, packet_bytes, timestamp);
+        enqueue_packet(state, data + descriptor->PacketOffset, packet_size, timestamp);
         return;
     }
 
-    std::vector<uint8_t> bytes(data, data + bounded_size);
-    enqueue_packet(state, bytes, timestamp);
+    enqueue_packet(state, data, bounded_size, timestamp);
 }
 
 void CALLBACK direct_packet_callback(
@@ -788,6 +790,22 @@ void apply_capture_config(CaptureState* state, const PktmonCaptureConfig* config
     state->include_empty_payloads = config->include_empty_payloads != 0;
 }
 
+void fill_packet(PktmonPacket* packet, const ParsedPacket& item, const std::vector<uint8_t>& payload) {
+    packet->timestamp_unix = item.timestamp_unix;
+    packet->protocol = item.protocol;
+    packet->source_port = item.source_port;
+    packet->destination_port = item.destination_port;
+    packet->payload = payload.empty() ? nullptr : payload.data();
+    packet->payload_size = static_cast<uint32_t>(payload.size());
+
+    std::snprintf(packet->source_address, sizeof(packet->source_address), "%s", item.source_address.c_str());
+    std::snprintf(
+        packet->destination_address,
+        sizeof(packet->destination_address),
+        "%s",
+        item.destination_address.c_str());
+}
+
 }  // namespace
 
 PKTMON_EXPORT int32_t PktmonVersion() {
@@ -893,19 +911,53 @@ PKTMON_EXPORT int32_t PktmonRead(
     state->queue.pop_front();
     state->read_payload = std::move(item.payload);
 
-    packet->timestamp_unix = item.timestamp_unix;
-    packet->protocol = item.protocol;
-    packet->source_port = item.source_port;
-    packet->destination_port = item.destination_port;
-    packet->payload = state->read_payload.data();
-    packet->payload_size = static_cast<uint32_t>(state->read_payload.size());
+    fill_packet(packet, item, state->read_payload);
+    return PKTMON_OK;
+}
 
-    std::snprintf(packet->source_address, sizeof(packet->source_address), "%s", item.source_address.c_str());
-    std::snprintf(
-        packet->destination_address,
-        sizeof(packet->destination_address),
-        "%s",
-        item.destination_address.c_str());
+PKTMON_EXPORT int32_t PktmonReadBatch(
+    PktmonHandle handle,
+    PktmonPacket* packets,
+    uint32_t packet_count,
+    uint32_t timeout_ms,
+    uint32_t* packets_read) {
+    auto* state = static_cast<CaptureState*>(handle);
+    if (packets_read != nullptr) {
+        *packets_read = 0;
+    }
+    if (state == nullptr || packets == nullptr || packets_read == nullptr || packet_count == 0) {
+        return PKTMON_E_INVALID_ARGUMENT;
+    }
+    for (uint32_t i = 0; i < packet_count; ++i) {
+        if (packets[i].struct_size != sizeof(PktmonPacket)) {
+            return PKTMON_E_INVALID_ARGUMENT;
+        }
+    }
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->started) {
+        return PKTMON_E_NOT_STARTED;
+    }
+    if (state->queue.empty()) {
+        state->ready.wait_for(lock, std::chrono::milliseconds(timeout_ms));
+    }
+    if (state->queue.empty()) {
+        return PKTMON_E_TIMEOUT;
+    }
+
+    state->read_batch_payloads.clear();
+    const uint32_t available = static_cast<uint32_t>(state->queue.size());
+    const uint32_t count = packet_count < available ? packet_count : available;
+    state->read_batch_payloads.reserve(count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        ParsedPacket item = std::move(state->queue.front());
+        state->queue.pop_front();
+        state->read_batch_payloads.push_back(std::move(item.payload));
+        fill_packet(&packets[i], item, state->read_batch_payloads.back());
+    }
+
+    *packets_read = count;
     return PKTMON_OK;
 }
 
