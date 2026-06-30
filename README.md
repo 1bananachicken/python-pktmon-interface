@@ -2,11 +2,6 @@
 
 Generic Python interface for Windows `pktmon` packet capture.
 
-This project was extracted from MaaNTE's `tools/pktmon_coordinate_backend`
-experiment and made self-contained. It deliberately does not include
-MaaNTE-specific coordinate decoding; consumers should build protocol decoders on
-top of the packet API, the same way they would with Scapy.
-
 It provides:
 
 - a small C++ shim DLL over `PktMonApi.dll` realtime streams;
