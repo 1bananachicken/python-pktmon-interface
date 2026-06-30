@@ -21,7 +21,7 @@ namespace {
 
 constexpr int32_t kVersion = 4;
 constexpr uint32_t kDefaultQueueCapacity = 8192;
-constexpr uint16_t kDefaultBufferSizeMultiplier = 1;
+constexpr uint16_t kDefaultBufferSizeMultiplier = 4;
 constexpr uint16_t kDefaultTruncationSize = 9000;
 
 constexpr std::array<const char*, 9> kPktmonExports = {
@@ -537,18 +537,18 @@ bool parse_packet_bytes(const uint8_t* bytes, size_t byte_count, double timestam
     return false;
 }
 
-void enqueue_packet(
+bool enqueue_packet(
     CaptureState* state,
     const uint8_t* bytes,
     size_t byte_count,
     double timestamp_unix = 0.0) {
     ParsedPacket packet;
     if (!parse_packet_bytes(bytes, byte_count, timestamp_unix, &packet)) {
-        return;
+        return false;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!state->include_empty_payloads && packet.payload.empty()) {
-        return;
+        return false;
     }
     const uint32_t queue_capacity =
         state->queue_capacity > 0 ? state->queue_capacity : kDefaultQueueCapacity;
@@ -557,6 +557,7 @@ void enqueue_packet(
     }
     state->queue.push_back(std::move(packet));
     state->ready.notify_one();
+    return true;
 }
 
 double stream_descriptor_timestamp(const PACKETMONITOR_STREAM_DATA_DESCRIPTOR* descriptor) {
@@ -589,7 +590,10 @@ void enqueue_stream_data(
         if (descriptor->PacketLength > 0 && descriptor->PacketLength < packet_size) {
             packet_size = descriptor->PacketLength;
         }
-        enqueue_packet(state, data + descriptor->PacketOffset, packet_size, timestamp);
+        if (enqueue_packet(state, data + descriptor->PacketOffset, packet_size, timestamp)) {
+            return;
+        }
+        enqueue_packet(state, data, bounded_size, timestamp);
         return;
     }
 

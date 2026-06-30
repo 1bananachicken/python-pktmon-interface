@@ -24,7 +24,7 @@ class PktmonSniffer:
         read_timeout_ms: int = 100,
         queue_size: int = 8192,
         native_queue_capacity: int = 8192,
-        buffer_size_multiplier: int = 1,
+        buffer_size_multiplier: int = 4,
         truncation_size: int = 9000,
         include_empty_payloads: bool = True,
         drain_batch_size: int = 64,

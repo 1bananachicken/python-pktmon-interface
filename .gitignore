@@ -14,4 +14,5 @@ build/
 dist/
 *.egg-info/
 raw_pktmon_output.txt
+manual_nte_coordinate_pktmon_test.py
 tmp_*/

@@ -167,7 +167,7 @@ class PktmonBackend:
         packet_filter: str = "tcp port 30031 or udp",
         *,
         queue_capacity: int = 8192,
-        buffer_size_multiplier: int = 1,
+        buffer_size_multiplier: int = 4,
         truncation_size: int = 9000,
         include_empty_payloads: bool = True,
     ) -> None:

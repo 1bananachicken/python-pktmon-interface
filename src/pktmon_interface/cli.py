@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     packets.add_argument("--timeout", type=float, default=30.0)
     packets.add_argument("--hex", type=int, default=32)
     packets.add_argument("--queue-size", type=int, default=8192)
-    packets.add_argument("--buffer-size-multiplier", type=int, default=1)
+    packets.add_argument("--buffer-size-multiplier", type=int, default=4)
     packets.add_argument("--truncation-size", type=int, default=9000)
     packets.add_argument("--read-timeout-ms", type=int, default=50)
     packets.add_argument("--drain-batch-size", type=int, default=64)
