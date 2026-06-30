@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyd
+*.pdb
+*.obj
+*.exp
+*.lib
+*.dll
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+raw_pktmon_output.txt
+tmp_*/
